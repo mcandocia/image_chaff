@@ -8,7 +8,9 @@ Can read and write different archive formats for efficiency.
 Designed to be used for cryptographic chaffing
 
 """
+import base64
 from collections import Counter
+from copy import deepcopy
 from functools import partial
 import gzip
 import io
@@ -22,8 +24,27 @@ import types
 import tarfile
 import zipfile
 
+ARCHIVE_SUFFIXES = ['.tar','.zip','.tar.gz','.tar.xz','.tar.bz2',]
+
+ARCHIVE_SUFFIX_REGEX = re.compile('(%s)' % '|'.join(
+    [x.replace('.',r'\.') + '$' for x in ARCHIVE_SUFFIXES]
+), flags=re.IGNORECASE)
+
+def is_archive(x):
+    return ARCHIVE_SUFFIX_REGEX.search(x)
+
+def get_archive_type(x):
+    if is_archive(x):
+        return re.sub(r'.*\.','',x).lower()
+    else:
+        return None
+
+def trunc_filename(x):
+    return os.path.split(x)[1]
+
+
 def png_fn(x, tracker=None):
-    x = re.sub(r'\..*','.png',x)
+    x = re.sub(r'\..*?$','.png',x)
     if tracker:
         x_copy = x
         i = 0
@@ -64,6 +85,7 @@ class ImageHandler:
                               in an archive format (.tar.gz,.tar.xz,.zip,.7z)
         @param n_channels - How many channels to use
         """
+
         if preprocessing is None:
             preprocessing = lambda x: x
 
@@ -71,6 +93,8 @@ class ImageHandler:
             
         self.preprocessing=preprocessing
         self.archive_type = archive_type
+        if not isinstance(filenames, (list, tuple)):
+            filenames = [filenames]        
             
         if archive_type is not None:
             self.load_archive(filenames)
@@ -81,34 +105,62 @@ class ImageHandler:
                 fn in filenames
             ]
             
+        self.calculate_image_stats()
+        self.flattened = None
+        
+        # flatten
+        self.flatten_images()
+
+    def calculate_image_stats(self):
         self.image_shapes = [
             image.shape for
             image in self.images
         ]
-        
         self.image_sizes = np.asarray([
             shape[0] * shape[1]
             for shape in self.image_shapes
         ])        
-        
         self.image_end_indices = np.cumsum(
             self.image_sizes
         )
-
         self.max_image_index = self.image_end_indices[-1]
-
         self.image_start_indices = np.insert(
             self.image_end_indices[:-1],
             0,
             0,
             axis=0
         )
+        self.n_images = len(self.image_shapes)        
 
-        self.n_images = len(self.image_shapes)
-        self.flattened = None
+    def __add__(self, x):
+        if x is None:
+            new_ih = deepcopy(self)
+            new_ih.flatten_images()
+        if not isinstance(x, self.__class__):
+            raise TypeError(f'x must be of type {self.__class__}, not {x.__class__}')
+        if self.flattened:
+            self.reconstitute_images()
+        if x.flattened:
+            x.reconstitute_images()
+
+        # create copy so that references aren't left dangling if
+        # self is later partially changed
+        new_self = deepcopy(self)
+        new_self.images += x.images
+        new_self.filenames += x.filenames
+        new_self.calculate_image_stats()
+
+        new_self.flatten_images()
         
-        # flatten
-        self.flatten_images()
+        return new_self
+
+    def __radd__(self,x):
+        if x is None:
+            new_ih = deepcopy(self)
+            new_ih.flatten_images()
+            return new_ih
+        return self + x
+            
 
     def load_archive(self, filenames):
         if isinstance(filenames, list):
@@ -117,51 +169,82 @@ class ImageHandler:
             fn = filenames
         if self.archive_type == 'gz':
             with tarfile.open(fn, 'r:gz') as f:
-                self.images = [
+                self.filenames, self.images = zip(*[
+                    (trunc_filename(member.name),
                     self.preprocessing(np.asarray(Image.open(f.extractfile(member))))
+                    )
                     for member in f
-                ]
+                ])
         elif self.archive_type == 'tar':
             with tarfile.open(fn, 'r') as f:
-                self.images = [
+                self.filenames, self.images = zip(*[
+                    (trunc_filename(member.name),
                     self.preprocessing(np.asarray(Image.open(f.extractfile(member))))
+                    )
                     for member in f
-                ]                
+                ])
         elif self.archive_type == 'xz':
             with tarfile.open(fn, 'r:xz') as f:
-                self.images = [
+                self.filenames, self.images = zip(*[
+                    (trunc_filename(member.name),
                     self.preprocessing(np.asarray(Image.open(f.extractfile(member))))
+                    )
                     for member in f
-                ]
+                ])
         elif self.archive_type == 'bz2':
             with tarfile.open(fn, 'r:bz2') as f:
-                self.images = [
+                self.filenames, self.images = zip(*[
+                    (trunc_filename(member.name),
                     self.preprocessing(np.asarray(Image.open(f.extractfile(member))))
+                    )
                     for member in f
-                ]                
+                ])
         elif self.archive_type == 'zip':
             with zipfile.ZipFile(fn, 'r') as zf:
-                self.images = [
-                    self.preprocessing(np.asarray(np.asarray(Image.open(zf.open(member)))))
+                self.filenames, self.images = zip(*[
+                    (trunc_filename(member.filename),
+                    self.preprocessing(np.asarray(Image.open(zf.open(member))))
+                    )
                     for member in zf.filelist
-                ]
+                ])
         elif self.archive_type == '7z':
             raise NotImplementedError('Archive type 7z not implemented yet')
         else:
             raise NotImplementedError(f'Archive type {self.archive_type} not implemented!')
-        
+
 
     def write_archive(
         self,
         filename,
-        archive_type,
+        archive_type=None,
         output_path='',
         overwrite=True,
         archive_filenames = None,
     ):
+        """
+        writes contents of files to an archive in tarball or zip format
+
+        @param filename - filename of output archive
+        @param archive_type - type of archive to create; will guess 
+         from filename if not specified
+        @param output_path - output directory to write to
+        @param overwrite - Will overwrite output if it already exists
+        @archive_filenames - filenames of individual images to name within archive;
+         can be a function that processes input filenames; defaults to input filenames
+        """
         output_fn = os.path.join(output_path,filename)
+        if archive_type is None:
+            if not is_archive(filename):
+                raise ValueError(f'archive type of {filename} cannot be determined!')
+            archive_type = get_archive_type(filename)
         if archive_filenames is None:
-            archive_filenames = self.filenames
+            archive_filenames = [
+                fn if isinstance(fn, str)
+                else (
+                    index_generators.md5_hex(bytes(str(fn), encoding='ascii'))
+                )[:-2] + '.png'
+                for fn in self.filenames
+            ]
         elif isinstance(archive_filenames, (types.FunctionType,partial)):
             archive_filenames = [archive_filenames(fn) for fn in self.filenames]
         
@@ -176,7 +259,10 @@ class ImageHandler:
 
         if archive_type == 'zip':
             with zipfile.ZipFile(output_fn, 'w') as zf:
+                #print([img.shape for img in self.images])
+                #print(archive_filenames)
                 for img, fn in zip(self.images, archive_filenames):
+                    #print('ZIP ITER')
                     img_io = io.BytesIO()
                     to_image(img).save(img_io,format='PNG')
                     img_io.seek(0)
@@ -235,6 +321,8 @@ class ImageHandler:
         """
         converts images back to original dimensions
         """
+        if not self.flattened:
+            return None
         self.flattened = False
         self.images = [
             self.images[
@@ -247,18 +335,42 @@ class ImageHandler:
         """
         converts images to long, 2-dimensional array
         """
+        if self.flattened:
+            return None
         self.flattened = True
         self.images = np.concatenate([
             img.reshape((np.prod(img.shape[:2]), img.shape[2]))
             for img in self.images
         ])
     
-    def write(self, output_filenames,output_path=''):
+    def write(
+        self,
+        output_filenames=None,
+        output_path=''
+    ):
+        """
+        write images to specified filenames and path
+
+        @param output_filenames - list of filenames to write to, or
+         function to modify input filenames; will default to input filenames if not specified
+
+        @ param output_path - directory to save to
+        """
+        if not output_filenames:
+            archive_filenames = [
+                fn if isinstance(fn, str)
+                else (
+                    index_generators.md5_hex(bytes(str(fn), encoding='ascii'))
+                )[:-2] + '.png'
+                for fn in self.filenames
+            ]            
         if self.flattened:
             print('Reconstituting images...')
             self.reconstitute_images()
         if isinstance(output_filenames, types.FunctionType):
             output_filenames = [output_filenames(fn) for fn in self.filenames]
+        elif isinstance(output_filenames, str):
+            output_filenames = [output_filenames]
         for i, fn in enumerate(output_filenames):
             img = Image.fromarray(np.uint8(self.images[i]))
             img.save(os.path.join(output_path, fn))
@@ -306,7 +418,8 @@ class ImageHandler:
             initial_truncsum = np.cumsum(trunc_pattern,axis=1)
             truncsum = np.insert(
                 initial_truncsum,0,0,axis=1
-            )[:,:trunc_pattern.shape[1]]            
+            )[:,:trunc_pattern.shape[1]]
+            #print(truncsum)
             # raw values
             raw_pixels = self.read_pixels(indices)
             trunc_powers = np.power(2,trunc_pattern)
@@ -315,12 +428,6 @@ class ImageHandler:
                 trunc_pattern.shape[1],
                 axis=1
             )
-            print('V')
-            print(value)
-            print('I')
-            print(initial_truncsum)
-            print('T')
-            print(truncsum)
             # convert value to array
             pixel_value = (
                 # for each value,
@@ -352,6 +459,15 @@ class ImageHandler:
             else:
                 raise ValueError('Cannot compare image array to flattened array')
         return elemwise_equals(self.images,x.images)
+
+    def __str__(self):
+        return (
+            f'ImageHandler object with {self.n_images} images, archive type {self.archive_type}, '
+            f'and max image index of {self.max_image_index}. Filenames length: {len(self.filenames)}'
+        )
+
+    def __repr__(self):
+        return self.__str__()    
     
 
 def test_image_handler():
@@ -372,7 +488,8 @@ def test_image_handler():
     ih = ImageHandler(
         filenames
     )
-    N_PIXELS = 16000
+    #N_PIXELS = 1667200
+    N_PIXELS = 16672
     indices = []
     gp = index_generators.crypto_generator(
         b'A' * 32,
@@ -383,7 +500,7 @@ def test_image_handler():
 
     # get channel patterns
 
-    if False:
+    if True:
         # 1-byte values
         gc = index_generators.crypto_generator(
             b'Ah' * 16,
@@ -399,10 +516,12 @@ def test_image_handler():
         ]
         # generate values
         gv = index_generators.crypto_generator(
-            b'\x00' * 32,
+            b'\x00' * 32 + os.urandom(16),
             mod=256,
         )
         values = [next(gv) for _ in range(N_PIXELS)]
+        from collections import Counter
+        print('Max Channel Count: %s' % np.max(list(Counter(pixels).values())))
     else:
         # 2-byte values
         gc = index_generators.crypto_generator(
@@ -440,7 +559,6 @@ def test_image_handler():
         values = [next(gv) for _ in range(N_PIXELS)]        
 
 
-
     # let's read the pixels
     print('READ')
     print(ih.read_pixels(pixels))
@@ -452,6 +570,29 @@ def test_image_handler():
         value=values,
         trunc_pattern=patterns
     )
+
+    read_values = ih.read_pixels(
+        indices = pixels,
+        trunc_pattern = patterns
+    )
+
+    if not np.all(read_values == values):
+        print('write/read mismatch')
+        diffs = [
+            (i,x,y,c) for i, (x,y,c) in enumerate(zip(values,read_values,patterns)) if x != y
+        ]
+        if len(diffs) > 64:
+            print(diffs[:32])
+            print(diffs[-32:])
+        else:
+            print(diffs)
+        print(f'# mismatches: {len(diffs)}')
+        from collections import Counter
+        hamming_dists = Counter([bin(x[1] ^ x[2]).count('1')for x in diffs])
+        print(f'hamming dists: {hamming_dists}')
+        raise ValueError('read/write mismatch!')
+              
+    
 
     ih.write(output_filenames = lambda x: x.replace('.','_modified.'))
 
@@ -503,7 +644,9 @@ def test_image_handler():
             ),
             archive_type=fmt
         )
-        print(f'{fmt.upper()} CHECK: %s' % new_ih.has_same_images(ih))    
+        print(f'{fmt.upper()} CHECK: %s' % new_ih.has_same_images(ih))
+
+
 
     
 
