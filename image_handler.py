@@ -381,15 +381,16 @@ class ImageHandler:
         trunc_pattern=None,
     ):
 
-        if not trunc_pattern:
+        if trunc_pattern is None:
             # literally read pixels
             return self.images[indices]
         else:
-            trunc_pattern = np.asarray(trunc_pattern)
+            if not isinstance(trunc_pattern, np.ndarray):
+                trunc_pattern = np.asarray(trunc_pattern)
             # read bits of pixels, convert to bytes
             # this is the multiplier for each index as the exponent of 2
             truncsum = np.insert(
-                np.cumsum(trunc_pattern,axis=1),0,0,axis=1
+               np.cumsum(trunc_pattern,axis=1),0,0,axis=1
             )[:,:trunc_pattern.shape[1]]
             #print(truncsum)
             return np.sum(
@@ -408,12 +409,13 @@ class ImageHandler:
         trunc_pattern=None,
     ):
 
-        if not trunc_pattern:
+        if trunc_pattern is None:
             self.images[indices] = value
         else:
             if isinstance(value, list):
                 value = np.asarray(value)
-            trunc_pattern = np.asarray(trunc_pattern)            
+            if not isinstance(trunc_pattern, np.ndarray):                
+                trunc_pattern = np.asarray(trunc_pattern)            
             # this is the multiplier for each index as the exponent of 2
             initial_truncsum = np.cumsum(trunc_pattern,axis=1)
             truncsum = np.insert(
