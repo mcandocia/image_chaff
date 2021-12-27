@@ -52,6 +52,12 @@ def get_options():
         default=''
     )
 
+    parser.add_argument(
+        '--use-disk',
+        help='Stores written pixel data on disk rather than set to use disk space instead of memory at the expense of speed',
+        action='store_true',
+    )
+
     write_parser = parser.add_argument_group(
         'Write'
     )
@@ -322,7 +328,8 @@ def run_read_mode(options):
     pixel_generator = crypto_generator(
         key2,
         unique=True,
-        mod=ih.max_image_index
+        mod=ih.max_image_index,
+        disk_storage = options['use_disk'],
     )
 
     # nonce + tag
@@ -450,15 +457,16 @@ def run_read_mode(options):
         cuml_pixels += N_PIXELS_STEP4
         if cuml_pixels >= ih.max_image_index:
             raise ValueError('Insufficient space to store data')        
-        pixels_step4 = [next(pixel_generator) for _ in range(N_PIXELS_STEP4)]
-        channels_step4 = [
+        pixels_step4 = ([next(pixel_generator) for _ in range(N_PIXELS_STEP4)])
+        # TODO: check to see if the np.array is causing error
+        channels_step4 = ([
             (
                 [3,3,2],
                 [3,2,3],
                 [2,3,3],
             )[next(channel_generator)]
             for _ in range(N_PIXELS_STEP4)
-        ]        
+        ])
         values_step4 = ih.read_pixels(
             pixels_step4,
             trunc_pattern=channels_step4
@@ -554,7 +562,8 @@ def run_write_mode(options):
     pixel_generator = crypto_generator(
         key2,
         unique=True,
-        mod=ih.max_image_index
+        mod=ih.max_image_index,
+        disk_storage = options['use_disk'],        
     )
 
     if N_PIXELS >= ih.max_image_index:
@@ -574,14 +583,14 @@ def run_write_mode(options):
         key3,
         mod=3
     )
-    channels = [
+    channels = ([
         (
             [3,3,2],
             [3,2,3],
             [2,3,3],
         )[next(channel_generator)]
         for _ in range(N_PIXELS)
-    ]
+    ])
 
     ih.write_pixels(
         indices = pixels,
@@ -636,7 +645,8 @@ def generate_source_images(params, original_ih = None):
             gp = crypto_generator(
                 os.urandom(16),
                 mod=ih.max_image_index,
-                unique=True
+                unique=True,
+                disk_storage = options['use_disk'],                
             )
             gc = crypto_generator(
                 os.urandom(16),
@@ -662,7 +672,6 @@ def generate_source_images(params, original_ih = None):
                 next(gp)
                 for _ in range(modded_pixels)
             ]
-
             ih.write_pixels(
                 pixels,
                 values,
