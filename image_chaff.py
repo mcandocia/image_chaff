@@ -1,5 +1,7 @@
 import argparse
 from Crypto.Cipher import AES
+import datetime
+import gc
 from getpass import getpass
 import io
 import numpy as np
@@ -19,11 +21,24 @@ from encryption import HEADER_STRUCT_FORMAT
 
 # TODO: test and debug >_<
 
-
-
 HEADER_IDENTIFIER=b'WHAT IS IN HERE?'
 
 CHANNEL_PATTERNS = [[3,3,2],[3,2,3],[2,3,3]]
+
+MAIN_CHUNK_SIZE = 2 ** 18
+
+VERBOSE_LOG=False
+def verbose_log(x,**kwargs):
+    if VERBOSE_LOG:
+        tsp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f'[{tsp}] - {x}', **kwargs)
+
+def chunk_seq(N, chunk_size=MAIN_CHUNK_SIZE):
+    while N > chunk_size:
+        N -= chunk_size
+        yield chunk_size
+    if N > 0:
+        yield N
 
 # reduces effectiveness of rainbow tables
 DEFAULT_PEPPER = b'77StrangeSigmoidalSerpentineSaltSnacks'
@@ -43,7 +58,8 @@ def get_options():
 
     parser.add_argument(
         'filename',
-        help='Filename to read from (read mode)/write to (write mode)'
+        help='Filename to read from (read mode)/write to (write mode)',
+        default='',
     )
 
     parser.add_argument(
@@ -57,6 +73,13 @@ def get_options():
         help='Stores written pixel data on disk rather than set to use disk space instead of memory at the expense of speed',
         action='store_true',
     )
+
+    parser.add_argument(
+        '-v','--verbose',
+        help='Prints more output on steps.',
+        action='store_true'
+    )
+        
 
     write_parser = parser.add_argument_group(
         'Write'
@@ -114,10 +137,19 @@ def get_options():
         help='Filename to put in header'
     )
 
+    """
     write_parser.add_argument(
         '--output-filename',
         required=False,
         help='Filename with appropriate suffix.'
+    )
+    """
+
+    write_parser.add_argument(
+        '--noise-ratio',
+        default=0.0,
+        type=float,
+        help='Ratio of noise to add to initial images'
     )
 
     # read args
@@ -141,7 +173,7 @@ def get_options():
     credential_parser.add_argument(
         '--multi-password-file',
         default='',
-        help='File containing many passwords to try to use. For read mode only.',
+        help='File containing many passwords to try to use. For read mode only. NOT YET IMPLEMENTED.',
         required=False,
     )
 
@@ -232,9 +264,10 @@ def get_options():
         raise ValueError('{header_filename} not a valid header filename option'.format(**options))
 
     if options['mode'] == 'write':
-        if not options['output_filename']:
+        
+        if not options['filename']:
             raise ValueError('output_filename needs to be defined in write mode!')
-        options['write_archive_type'] = get_archive_type(options['output_filename'])
+        options['write_archive_type'] = get_archive_type(options['filename'])
     
     if options['salt'] is None:
         options['salt'] = md5_bytes(DEFAULT_PEPPER)[:16] #os.urandom(16)
@@ -254,6 +287,10 @@ def get_options():
             options['header_filename'] = 'mystery.dat'
     
     manage_passwords(options)
+
+    if options['verbose']:
+        global VERBOSE_LOG
+        VERBOSE_LOG=True
 
     priv_key_pass = None
     if options['priv_key_password']:
@@ -294,12 +331,18 @@ def manage_passwords(options):
     options['password'] = password
 
     return password
+
+
+
+    
     
 
 def run(options):
     if options['mode'] == 'read':
+        verbose_log('read mode')
         run_read_mode(options)
     elif options['mode'] == 'write':
+        verbose_log('write mode')
         run_write_mode(options)
 
 def run_read_mode(options):
@@ -311,12 +354,14 @@ def run_read_mode(options):
     #print(f'max idx: {ih.max_image_index}')
 
     # hash password
+    verbose_log('key 1 hash')
     key = encryption.argon2_hash(options['password'], **options)
     #print(f'key: {key}')
 
     # if 1 pass
     # run decryptor
     # decrypt first three blocks (1:nonce, 2: header identifier, 3:header info)
+    verbose_log('key 2 hash')
     key2 = encryption.argon2_hash(
         key,
         salt=DEFAULT_PEPPER,
@@ -336,8 +381,10 @@ def run_read_mode(options):
     N_PIXELS_STEP1 = 64
     if N_PIXELS_STEP1 >= ih.max_image_index:
         raise ValueError('Insufficient space to store data')
+    verbose_log('pixels step 1')
     pixels_step1 = [next(pixel_generator) for _ in range(N_PIXELS_STEP1)]
-    
+
+    verbose_log('key 3 hash')
     # generate channel pattern
     key3 = encryption.argon2_hash(
         key2,
@@ -351,6 +398,7 @@ def run_read_mode(options):
         key3,
         mod=3
     )
+    verbose_log('step 1')
     channels_step1 = [
         (
             [3,3,2],
@@ -384,6 +432,7 @@ def run_read_mode(options):
         # fast way to fail
         print(decrypted_identifier)
         raise ValueError('Header identifier does not match!')
+    verbose_log('decrypting header')
     decrypted_header = cipher_d.decrypt(encrypted_header)
     #print(f'DHB: {decrypted_header}')
     data_length, header_filename_length, signature_byte, rsa_size_byte = struct.unpack(
@@ -397,8 +446,10 @@ def run_read_mode(options):
     rsa_size = rsa_size_byte * 128
     n_data_signature_blocks = rsa_size / 16
     cuml_pixels = N_PIXELS_STEP1
+    verbose_log('parsed header')
     # read signature from required blocks (0, 16, 32, 48, 64)
     if n_data_signature_blocks > 0:
+        verbose_log('step 2 start')
         N_PIXELS_STEP2 = rsa_size
         cuml_pixels += N_PIXELS_STEP2
         
@@ -418,11 +469,13 @@ def run_read_mode(options):
             trunc_pattern=channels_step2
         ).astype(np.uint8).tobytes()
         data_signature = cipher_d.decrypt(values_step2)
+        verbose_log('step 2 complete')
     else:
         data_signature = None
 
     # read filename
     if n_filename_blocks:
+        verbose_log('step 3 start')
         N_PIXELS_STEP3 = n_filename_blocks * 16
         cuml_pixels += N_PIXELS_STEP3
         if cuml_pixels >= ih.max_image_index:
@@ -448,44 +501,59 @@ def run_read_mode(options):
         filename = re.sub(r'[^A-Za-z0-9_.-]','', filename.decode('utf-8'))
         if len(filename) == '':
             raise ValueError('Filename is blank after replacing illegal characters!')
+        verbose_log('step 3 end')
+        
+        if options['read_outfile']:
+            filename = options['read_outfile']
+            verbose_log('filename manually provided (forced)')
     else:
         filename = options['read_outfile']
+        verbose_log('filename manually provided')
+
+
 
     # read data
+    data = b''
     if n_data_blocks:
+        verbose_log('start step 4')
         N_PIXELS_STEP4 = n_data_blocks * 16
-        cuml_pixels += N_PIXELS_STEP4
-        if cuml_pixels >= ih.max_image_index:
-            raise ValueError('Insufficient space to store data')        
-        pixels_step4 = ([next(pixel_generator) for _ in range(N_PIXELS_STEP4)])
-        # TODO: check to see if the np.array is causing error
-        channels_step4 = ([
-            (
-                [3,3,2],
-                [3,2,3],
-                [2,3,3],
-            )[next(channel_generator)]
-            for _ in range(N_PIXELS_STEP4)
-        ])
-        values_step4 = ih.read_pixels(
-            pixels_step4,
-            trunc_pattern=channels_step4
-        ).astype(np.uint8).tobytes()
-        data = cipher_d.decrypt(values_step4)
-
-    else:
-        data = b''
-        
+        # chunk this
+        for i, n_subpixels in enumerate(chunk_seq(N_PIXELS_STEP4)):
+            verbose_log(f'step 4 iter {i}')
+            #gc.collect()
+            #verbose_log('GC CALL')
+            cuml_pixels += n_subpixels #N_PIXELS_STEP4
+            if cuml_pixels >= ih.max_image_index:
+                raise ValueError('Insufficient space to store data')        
+            pixels_step4 = ([next(pixel_generator) for _ in range(n_subpixels)])
+            # TODO: check to see if the np.array is causing error
+            channels_step4 = ([
+                (
+                    [3,3,2],
+                    [3,2,3],
+                    [2,3,3],
+                )[next(channel_generator)]
+                for _ in range(n_subpixels)
+            ])
+            values_step4 = ih.read_pixels(
+                pixels_step4,
+                trunc_pattern=channels_step4
+            ).astype(np.uint8).tobytes()
+            data += cipher_d.decrypt(values_step4)
+            
     #print(f'cuml_pixels: {cuml_pixels}')
-    # tag verify    
+    # tag verify
+    verbose_log('verifying tag')
     try:
         verification_status = cipher_d.verify(tag)
     except Exception as e:
         print('Tag verification failed!')
         raise e # put this back after testing
-
+    
+    verbose_log('tag verified')
     # rsa signature verify
     if options['verifier']:
+        verbose_log('RSA verification start')
         #print('Verify Length: %s' % len(filename_data[:header_filename_length] + data))
         #print(len(data))
         #print(header_filename_length)
@@ -495,6 +563,7 @@ def run_read_mode(options):
         )
         if not verification_status:
             raise Exception('Signature could not be verified!') # put this back after testing
+        verbose_log('RSA verification complete')
 
     # return
     data = data[:data_length]
@@ -502,8 +571,11 @@ def run_read_mode(options):
         options['output_directory'],
         filename
     )
+    verbose_log('beginning file write')
     with open(output_filepath, 'wb') as f:
         f.write(data)
+
+    verbose_log('file write complete')
 
     # TODO: if many pass
     # try to keep on running decryptor for first 2 blocks
@@ -516,11 +588,14 @@ def run_write_mode(options):
     file_list = []
     ih = None    
     if options['source_images']:
+        verbose_log('beginning source image read')
         file_list += options['source_images']
         # check if archives
         if any([is_archive(fn) for fn in file_list]):
+            verbose_log('searching for archives')
             for fn in file_list:
                 archive_type = get_archive_type(fn)
+                verbose_log(f'reading from archive {fn} with archive type {archive_type}')
                 if ih is None:
                     ih = ImageHandler(fn, archive_type=archive_type)
                 else:
@@ -528,21 +603,92 @@ def run_write_mode(options):
         else:
             ih = ImageHandler(file_list)
 
+    if options['noise_ratio']:
+        random_seed = os.urandom(16)
+        noisy_pixels = int(options['noise_ratio'] * ih.max_image_index)
+        verbose_log(f'generating {noisy_pixels} noisy pixels on source images')
+        # create sequence generators
+        key1 = encryption.argon2_hash(
+            random_seed,
+            salt=DEFAULT_PEPPER,
+            rounds=32,
+            memory=2**16,
+            buflen=32,
+            p=2
+        )
+        key2 = encryption.argon2_hash(
+            key1,
+            salt=DEFAULT_PEPPER,
+            rounds=32,
+            memory=2**16,
+            buflen=32,
+            p=2
+        )
+        key3 = encryption.argon2_hash(
+            key2,
+            salt=DEFAULT_PEPPER,
+            rounds=32,
+            memory=2**16,
+            buflen=32,
+            p=2
+        )
+        channel_generator = crypto_generator(
+            key3,
+            mod=3
+        )
+        pixel_generator = crypto_generator(
+            key2,
+            unique=False,
+            mod=ih.max_image_index,
+            disk_storage = options['use_disk'],
+        )
+        noise_generator = crypto_generator(
+            key1,
+            mod=256
+        )        
+        for i, n_subpixels in enumerate(chunk_seq(noisy_pixels)):
+            pct = 100 * n_subpixels/noisy_pixels
+            verbose_log(f'[{pct:0.1f}%] writing {n_subpixels}/{noisy_pixels} bytes of noise')
+            pixels = [next(pixel_generator) for _ in range(n_subpixels)]
+            channels = [
+                [
+                    [3,3,2],
+                    [3,2,3],
+                    [2,3,3],
+                ][next(channel_generator)]
+                for _ in range(n_subpixels)
+            ]
+            values = [next(noise_generator) for _ in range(n_subpixels)]
+            #print(len(values))
+            #print(ih.max_image_index)
+            #print(ih.archive_type)
+            #print(ih.image_shapes)
+            ih.write_pixels(
+                indices = pixels,
+                value = values,
+                trunc_pattern = channels
+            )
+
     if options['image_construction_params']:
+        verbose_log('generating source images')
         ih = generate_source_images(options['image_construction_params'], ih)
             
     # read in data
     if options['message']:
+        verbose_log('converting message to bytes')
         data = bytes(options['message'], encoding='UTF-8')
     elif options['source_data']:
+        verbose_log('reading source data')
         with open(options['source_data'], 'rb') as f:
             data = f.read()
     else:
         # should log warning here probably
+        verbose_log('no data provided!')
         data = b''
 
     # TODO: create memory-efficient  version of this code
     # create data
+    verbose_log('encrypting data')
     key, encrypted_data = encryption.data_to_encrypted(data, **options)
 
     N_PIXELS = len(encrypted_data)
@@ -551,6 +697,7 @@ def run_write_mode(options):
 
     # write data to image
     # generate pixels
+    verbose_log('key 2 hash')
     key2 = encryption.argon2_hash(
         key,
         salt=DEFAULT_PEPPER,
@@ -568,9 +715,10 @@ def run_write_mode(options):
 
     if N_PIXELS >= ih.max_image_index:
         raise ValueError('Insufficient space to store data')
-    pixels = [next(pixel_generator) for _ in range(N_PIXELS)]
+
     
     # generate channel pattern
+    verbose_log('key 3 hash')
     key3 = encryption.argon2_hash(
         key2,
         salt=DEFAULT_PEPPER,
@@ -583,31 +731,47 @@ def run_write_mode(options):
         key3,
         mod=3
     )
-    channels = ([
-        (
-            [3,3,2],
-            [3,2,3],
-            [2,3,3],
-        )[next(channel_generator)]
-        for _ in range(N_PIXELS)
-    ])
+    # use subpixels
+    chunk_start_idx = 0
+    for i, n_subpixels in enumerate(chunk_seq(N_PIXELS)):
+        verbose_log(f'writing iter {i}')
+        #gc.collect()
+        #verbose_log('GC CALL')        
+        pixels = [
+            next(pixel_generator) for _ in range(n_subpixels)
+        ]
 
-    ih.write_pixels(
-        indices = pixels,
-        value=np.frombuffer(encrypted_data,dtype=np.uint8),
-        trunc_pattern=channels
-    )
+        channels = ([
+            (
+                [3,3,2],
+                [3,2,3],
+                [2,3,3],
+            )[next(channel_generator)]
+            for _ in range(n_subpixels)
+        ])
+
+        ih.write_pixels(
+            indices = pixels,
+            value=np.frombuffer(
+                encrypted_data[chunk_start_idx:chunk_start_idx+n_subpixels],
+                dtype=np.uint8
+            ),
+            trunc_pattern=channels
+        )
+        chunk_start_idx += n_subpixels
 
     # save image (in appropriate mode)
     if options['write_archive_type']:
+        verbose_log('writing to archive')
         ih.write_archive(
-            filename = options['output_filename'],
+            filename = options['filename'],
             archive_type = options['write_archive_type'],
             output_path=options['output_directory'],
         )
     else:
+        verbose_log('writing to file')
         ih.write(
-            output_filenames = options['output_filename'],
+            output_filenames = options['filename'],
             output_path=options['output_directory'],            
         )
 
@@ -645,8 +809,8 @@ def generate_source_images(params, original_ih = None):
             gp = crypto_generator(
                 os.urandom(16),
                 mod=ih.max_image_index,
-                unique=True,
-                disk_storage = options['use_disk'],                
+                unique=False,
+                disk_storage = options['use_disk'],
             )
             gc = crypto_generator(
                 os.urandom(16),

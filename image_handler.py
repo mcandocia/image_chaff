@@ -415,8 +415,9 @@ class ImageHandler:
             if isinstance(value, list):
                 value = np.asarray(value)
             if not isinstance(trunc_pattern, np.ndarray):                
-                trunc_pattern = np.asarray(trunc_pattern)            
+                trunc_pattern = np.asarray(trunc_pattern)
             # this is the multiplier for each index as the exponent of 2
+            #print(trunc_pattern)
             initial_truncsum = np.cumsum(trunc_pattern,axis=1)
             truncsum = np.insert(
                 initial_truncsum,0,0,axis=1
