@@ -1,0 +1,5 @@
+argon2-cffi==21.3.0
+numpy>=1.19.4
+Pillow>=8.0.1
+pycryptodome>=3.10.1
+
