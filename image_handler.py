@@ -381,7 +381,7 @@ class ImageHandler:
                 for fn in self.filenames
             ]            
         if self.flattened:
-            print('Reconstituting images...')
+            #print('Reconstituting images...')
             self.reconstitute_images()
         if isinstance(output_filenames, types.FunctionType):
             output_filenames = [output_filenames(fn) for fn in self.filenames]
@@ -529,22 +529,30 @@ class ImageHandler:
         if not originally_flat:
             self.reconstitute_images()
 
-    def create_15bit_channel_hash(self):
+    def create_15bit_channel_hash(self, *, bit_shift_override=3):
         """
         create a hash based on the most significant 5 bits of each channel
         this can be used to create a type of unique but extractable salt
         to avoid the same password generating the same pattern
+
+        @param bit_shift_override - If you want to get a hash with a different set of bits,
+                                    this can be modified, but it does not have use thus far
+                                    in this code (setting this to 0 can quickly compare a large
+                                    collection of images/sets of images)
         """
         originally_flattened = self.flattened
         if not originally_flattened:
             self.flatten_images()
 
-        img_15b = np.right_shift(self.images, 3)
+        img_15b = np.right_shift(self.images, bit_shift_override)
         hash_val = b'X'
         # iterates through each pixel
         for i in range(self.images.shape[0]):
-            new_val = b'|'.join([bytes(str(x), encoding='ascii') for x in self.images[i]])
+            new_val = b'|'.join([bytes(str(x), encoding='ascii') for x in img_15b[i]])
             hash_val = index_generators.md5_bytes(hash_val + new_val)
+
+        #print(self.image_shapes)
+        #print(b'HASH VALUE: ' + hash_val)
 
 
         if not originally_flattened:

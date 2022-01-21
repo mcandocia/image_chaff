@@ -367,6 +367,12 @@ def run_read_mode(options):
     )
     #print(f'max idx: {ih.max_image_index}')
 
+    if not options['no_image_salt']:
+        hashed_salt = ih.create_15bit_channel_hash()
+        options['salt'] += hashed_salt
+    else:
+        hashed_salt = b''
+
     # hash password
     verbose_log('key 1 hash')
     key = encryption.argon2_hash(options['password'], **options)
@@ -590,6 +596,7 @@ def run_write_mode(options):
 
     if options['salt_noise']:
         ih.add_noise_to_nth_bit(options['salt_noise'], n=4)
+        
 
     if options['noise_ratio']:
         #random_seed = os.urandom(16)
@@ -602,6 +609,12 @@ def run_write_mode(options):
     if options['image_construction_params']:
         verbose_log('generating source images')
         ih = generate_source_images(options['image_construction_params'], ih)
+
+    if not options['no_image_salt']:
+        hashed_salt = ih.create_15bit_channel_hash()
+        options['salt'] += hashed_salt
+    else:
+        hashed_salt = b''        
             
     # read in data
     if options['message']:
