@@ -3,6 +3,12 @@ from collections import deque
 import hashlib
 import tempfile
 
+CHANNEL_ORDER = (
+    (3,3,2),
+    (3,2,3),
+    (2,3,3),
+)
+
 def chunks(x, n):
     for i in range(0, len(x)):
         yield x[i:i+n]
@@ -15,6 +21,25 @@ def md5_hex(x):
 
 def sha256_bytes(x):
     return hashlib.sha256(x).digest()
+
+def create_channel_generator(
+    key = None,
+    *args,
+    **kwargs
+):
+    if key is None:
+        key = os.urandom(16)
+    generator = crypto_generator(
+        key,
+        *args,
+        mod=3,
+        **kwargs,
+    )
+
+    for elem in generator:
+        yield CHANNEL_ORDER[elem]
+        
+    
 
 def crypto_generator(
     initial_value,

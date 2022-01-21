@@ -22,6 +22,8 @@ from PIL import Image
 import re
 import types
 import tarfile
+from utility import chunk_seq
+from utility import grab
 import zipfile
 
 ARCHIVE_SUFFIXES = ['.tar','.zip','.tar.gz','.tar.xz','.tar.bz2',]
@@ -29,6 +31,9 @@ ARCHIVE_SUFFIXES = ['.tar','.zip','.tar.gz','.tar.xz','.tar.bz2',]
 ARCHIVE_SUFFIX_REGEX = re.compile('(%s)' % '|'.join(
     [x.replace('.',r'\.') + '$' for x in ARCHIVE_SUFFIXES]
 ), flags=re.IGNORECASE)
+
+def pngify(x):
+    return re.sub(r'\..*','.png',x)
 
 def is_archive(x):
     return ARCHIVE_SUFFIX_REGEX.search(x)
@@ -77,6 +82,7 @@ class ImageHandler:
         preprocessing=None,
         archive_type=None,
         n_channels=3,
+        pre_flatten=True,
     ):
         """
         @param filenames - Filenames of images to load 
@@ -109,7 +115,10 @@ class ImageHandler:
         self.flattened = None
         
         # flatten
-        self.flatten_images()
+        if pre_flatten:
+            self.flatten_images()
+        else:
+            self.flattened = False
 
     def calculate_image_stats(self):
         self.image_shapes = [
@@ -346,7 +355,8 @@ class ImageHandler:
     def write(
         self,
         output_filenames=None,
-        output_path=''
+        output_path='',
+        pngify_filenames=False
     ):
         """
         write images to specified filenames and path
@@ -356,6 +366,12 @@ class ImageHandler:
 
         @ param output_path - directory to save to
         """
+        if pngify_filenames:
+            if isinstance(output_filenames, str):
+                output_filenames = pngify(output_filenames)
+            else:
+                output_filenames = [pngify(output_filenames) for fn in output_filenames]
+                
         if not output_filenames:
             archive_filenames = [
                 fn if isinstance(fn, str)
@@ -432,6 +448,9 @@ class ImageHandler:
                 axis=1
             )
             # convert value to array
+            #print(value.shape)
+            #print(initial_truncsum.shape)
+            #print(truncsum.shape)
             pixel_value = (
                 # for each value,
                 # MOD across the exponentiated pattern (go with highest bit for each)
@@ -470,8 +489,161 @@ class ImageHandler:
         )
 
     def __repr__(self):
-        return self.__str__()    
-    
+        return self.__str__()
+
+    def generate_noise(
+        self,
+        noise_ratio,
+        patterns = [(3,3,2),(3,2,3),(2,3,3)],
+        seed = b'\x00' * 16,
+    ):
+        originally_flat = self.flattened
+        if not originally_flat:
+            self.flatten_images()
+
+        n_pixels = int(noise_ratio * self.max_image_index)
+        gp = index_generators.crypto_generator(
+            seed,
+            mod=self.max_image_index,
+            unique=True
+        )
+        gc = index_generators.crypto_generator(
+            seed + b'\x00',
+            mod = len(patterns)
+        )
+        gv = index_generators.crypto_generator(
+            seed + b'\x00' * 2,
+            mod=256
+        )
+        for i, n_subpixels in enumerate(chunk_seq(n_pixels)):
+            pixels = [next(gp) for _ in range(n_subpixels)]
+            channels = [patterns[next(gc)] for _ in range(n_subpixels)]
+            values = [next(gv) for _ in range(n_subpixels)]
+            self.write_pixels(
+                indices=pixels,
+                value=values,
+                trunc_pattern=channels
+            )
+            
+        # unflatten
+        if not originally_flat:
+            self.reconstitute_images()
+
+    def create_15bit_channel_hash(self):
+        """
+        create a hash based on the most significant 5 bits of each channel
+        this can be used to create a type of unique but extractable salt
+        to avoid the same password generating the same pattern
+        """
+        originally_flattened = self.flattened
+        if not originally_flattened:
+            self.flatten_images()
+
+        img_15b = np.right_shift(self.images, 3)
+        hash_val = b'X'
+        # iterates through each pixel
+        for i in range(self.images.shape[0]):
+            new_val = b'|'.join([bytes(str(x), encoding='ascii') for x in self.images[i]])
+            hash_val = index_generators.md5_bytes(hash_val + new_val)
+
+
+        if not originally_flattened:
+            self.reconstitute_images()
+
+        return hash_val
+
+    def add_noise_to_first_bits(self, n_bits):
+
+        if n_bits == 0:
+            return 
+        
+        channel_generator = index_generators.create_channel_generator(
+            os.urandom(16),
+        )
+        pixel_generator = self.create_pixel_generator()
+        
+        noise_generator = index_generators.crypto_generator(
+            os.urandom(16),
+            mod=256
+        )
+
+        if not isinstance(n_bits, int) and n_bits < 1:
+            n_bits = int(np.round(n_bits * ih.max_image_index))
+
+        for i, n_subpixels in enumerate(chunk_seq(n_bits)):
+            pixels = grab(pixel_generator, n_subpixels)
+            channels = grab(channel_generator, n_subpixels)
+            values = grab(noise_generator, n_subpixels)
+            self.write_pixels(
+                indices = pixels,
+                value = values,
+                trunc_pattern=channels
+            )
+
+    def add_noise_to_nth_bit(self, n_bits, n=4):
+        """
+        adds noise to single channel, ranging from 1 through 8
+
+        @param n_bits - Number of bits to write
+        @param n - Channel index
+
+        """
+        if n_bits == 0:
+            return
+        
+        originally_flattened = self.flattened
+        if not originally_flattened:
+            self.flatten_images()        
+
+        bits = os.urandom(n_bits)
+        pixel_generator = self.create_pixel_generator()
+        noise_generator = index_generators.crypto_generator(
+            os.urandom(16),
+            mod=2,
+        )
+
+        channel_selector = index_generators.crypto_generator(
+            os.urandom(16),
+            mod=3
+        )
+
+        IDX_POW = np.power(2, n-1)
+
+        for i, n_subpixels in enumerate(chunk_seq(n_bits)):
+            channels = grab(channel_selector, n_subpixels)
+            pixels = grab(pixel_generator, n_subpixels)
+            values = np.asarray(grab(noise_generator, n_subpixels))
+
+            # write by removing first N bits,
+            # then re-adding first N-1 bits,
+            # then add the bit values to the Nth bit
+            self.images[pixels,channels] = (
+                self.images[pixels,channels] -
+                np.mod(self.images[pixels,channels], IDX_POW * 2) +
+                np.mod(self.images[pixels,channels], IDX_POW)  +
+                IDX_POW * values
+            )
+
+        if not originally_flattened:
+            self.reconstitute_images()
+
+    def create_pixel_generator(
+        self,
+        initial_value=None,
+        initial_value_n_bits=16,
+        *args,
+        **kwargs
+    ):
+        if initial_value is None:
+            initial_value = os.urandom(initial_value_n_bits)
+        return index_generators.crypto_generator(
+            initial_value,
+            *args,
+            mod=self.max_image_index,
+            **kwargs
+        )
+
+        
 
 def test_image_handler():
     TEST_PATH='test_images'

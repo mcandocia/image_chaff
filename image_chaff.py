@@ -13,9 +13,12 @@ import struct
 import encryption
 from image_handler import ImageHandler
 from image_handler import ARCHIVE_SUFFIX_REGEX, is_archive, get_archive_type
+from index_generators import create_channel_generator
 from index_generators import crypto_generator
 from index_generators import md5_bytes
 from signatures import Verifier
+from utility import chunk_seq
+from utility import grab
 
 from encryption import HEADER_STRUCT_FORMAT
 
@@ -33,12 +36,6 @@ def verbose_log(x,**kwargs):
         tsp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f'[{tsp}] - {x}', **kwargs)
 
-def chunk_seq(N, chunk_size=MAIN_CHUNK_SIZE):
-    while N > chunk_size:
-        N -= chunk_size
-        yield chunk_size
-    if N > 0:
-        yield N
 
 # reduces effectiveness of rainbow tables
 DEFAULT_PEPPER = b'77StrangeSigmoidalSerpentineSaltSnacks'
@@ -252,9 +249,26 @@ def get_options():
     argon2_parser.add_argument(
         '--salt',
         required=False,
-        help='Salt for write mode. Uses hash of pepper by default. 16 bytes. '
-        'required, will be padded w/random or truncated as necessary',
+        help='Salt for write mode (really a pepper). Uses hash of pepper by default. 16 bytes. '
+        'will be padded with most significant 15 bytes of data unless suppressed',
         default=None,
+    )
+
+    parser.add_argument(
+        '--no-image-salt',
+        action='store_true',
+        help='If not selected, will not generate salt based on most significant 15 bits of '
+        'pixels for images. If selected, the same noise pattern will be present for the same '
+        'password and pepper.'
+    )
+
+    parser.add_argument(
+        '--salt-noise',
+        type=int,
+        default=128,
+        help='Number of pixels to add noise to 4th bit so that salts are unique '
+        'when same password is used on same images. 0 is safe if same permutation of '
+        'images will not be reused.'
     )
 
     args = parser.parse_args()
@@ -382,7 +396,7 @@ def run_read_mode(options):
     if N_PIXELS_STEP1 >= ih.max_image_index:
         raise ValueError('Insufficient space to store data')
     verbose_log('pixels step 1')
-    pixels_step1 = [next(pixel_generator) for _ in range(N_PIXELS_STEP1)]
+    pixels_step1 = grab(pixel_generator, N_PIXELS_STEP1)
 
     verbose_log('key 3 hash')
     # generate channel pattern
@@ -394,19 +408,11 @@ def run_read_mode(options):
         buflen=32,
         p=2,
     )
-    channel_generator = crypto_generator(
-        key3,
-        mod=3
+    channel_generator = create_channel_generator(
+        key3
     )
     verbose_log('step 1')
-    channels_step1 = [
-        (
-            [3,3,2],
-            [3,2,3],
-            [2,3,3],
-        )[next(channel_generator)]
-        for _ in range(N_PIXELS_STEP1)
-    ]
+    channels_step1 = grab(channel_generator, N_PIXELS_STEP1)
 
     values_step1 = ih.read_pixels(
         pixels_step1,
@@ -455,15 +461,8 @@ def run_read_mode(options):
         
         if cuml_pixels >= ih.max_image_index:
             raise ValueError('Insufficient space to store data')
-        pixels_step2 = [next(pixel_generator) for _ in range(N_PIXELS_STEP2)]
-        channels_step2 = [
-            (
-                [3,3,2],
-                [3,2,3],
-                [2,3,3],
-            )[next(channel_generator)]
-            for _ in range(N_PIXELS_STEP2)
-        ]        
+        pixels_step2 = grab(pixel_generator, N_PIXELS_STEP2)
+        channels_step2 = grab(channel_generator, N_PIXELS_STEP2)
         values_step2 = ih.read_pixels(
             pixels_step2,
             trunc_pattern=channels_step2
@@ -480,15 +479,8 @@ def run_read_mode(options):
         cuml_pixels += N_PIXELS_STEP3
         if cuml_pixels >= ih.max_image_index:
             raise ValueError('Insufficient space to store data')        
-        pixels_step3 = [next(pixel_generator) for _ in range(N_PIXELS_STEP3)]
-        channels_step3 = [
-            (
-                [3,3,2],
-                [3,2,3],
-                [2,3,3],
-            )[next(channel_generator)]
-            for _ in range(N_PIXELS_STEP3)
-        ]        
+        pixels_step3 = grab(pixel_generator, N_PIXELS_STEP3)
+        channels_step3 = grab(channel_generator, N_PIXELS_STEP3)
         values_step3 = ih.read_pixels(
             pixels_step3,
             trunc_pattern=channels_step3
@@ -525,16 +517,9 @@ def run_read_mode(options):
             cuml_pixels += n_subpixels #N_PIXELS_STEP4
             if cuml_pixels >= ih.max_image_index:
                 raise ValueError('Insufficient space to store data')        
-            pixels_step4 = ([next(pixel_generator) for _ in range(n_subpixels)])
+            pixels_step4 = grab(pixel_generator, n_subpixels)
             # TODO: check to see if the np.array is causing error
-            channels_step4 = ([
-                (
-                    [3,3,2],
-                    [3,2,3],
-                    [2,3,3],
-                )[next(channel_generator)]
-                for _ in range(n_subpixels)
-            ])
+            channels_step4 = grab(channel_generator, n_subpixels)
             values_step4 = ih.read_pixels(
                 pixels_step4,
                 trunc_pattern=channels_step4
@@ -603,71 +588,16 @@ def run_write_mode(options):
         else:
             ih = ImageHandler(file_list)
 
+    if options['salt_noise']:
+        ih.add_noise_to_nth_bit(options['salt_noise'], n=4)
+
     if options['noise_ratio']:
-        random_seed = os.urandom(16)
+        #random_seed = os.urandom(16)
         noisy_pixels = int(options['noise_ratio'] * ih.max_image_index)
         verbose_log(f'generating {noisy_pixels} noisy pixels on source images')
         # create sequence generators
-        key1 = encryption.argon2_hash(
-            random_seed,
-            salt=DEFAULT_PEPPER,
-            rounds=32,
-            memory=2**16,
-            buflen=32,
-            p=2
-        )
-        key2 = encryption.argon2_hash(
-            key1,
-            salt=DEFAULT_PEPPER,
-            rounds=32,
-            memory=2**16,
-            buflen=32,
-            p=2
-        )
-        key3 = encryption.argon2_hash(
-            key2,
-            salt=DEFAULT_PEPPER,
-            rounds=32,
-            memory=2**16,
-            buflen=32,
-            p=2
-        )
-        channel_generator = crypto_generator(
-            key3,
-            mod=3
-        )
-        pixel_generator = crypto_generator(
-            key2,
-            unique=False,
-            mod=ih.max_image_index,
-            disk_storage = options['use_disk'],
-        )
-        noise_generator = crypto_generator(
-            key1,
-            mod=256
-        )        
-        for i, n_subpixels in enumerate(chunk_seq(noisy_pixels)):
-            pct = 100 * n_subpixels/noisy_pixels
-            verbose_log(f'[{pct:0.1f}%] writing {n_subpixels}/{noisy_pixels} bytes of noise')
-            pixels = [next(pixel_generator) for _ in range(n_subpixels)]
-            channels = [
-                [
-                    [3,3,2],
-                    [3,2,3],
-                    [2,3,3],
-                ][next(channel_generator)]
-                for _ in range(n_subpixels)
-            ]
-            values = [next(noise_generator) for _ in range(n_subpixels)]
-            #print(len(values))
-            #print(ih.max_image_index)
-            #print(ih.archive_type)
-            #print(ih.image_shapes)
-            ih.write_pixels(
-                indices = pixels,
-                value = values,
-                trunc_pattern = channels
-            )
+        ih.add_noise_to_first_bits(noisy_pixels)
+        #for i, n_subpixels in enumerate(chunk_seq(noisy_pixels)):
 
     if options['image_construction_params']:
         verbose_log('generating source images')
@@ -727,9 +657,8 @@ def run_write_mode(options):
         buflen=32,
         p=2,
     )
-    channel_generator = crypto_generator(
+    channel_generator = create_channel_generator(
         key3,
-        mod=3
     )
     # use subpixels
     chunk_start_idx = 0
@@ -737,18 +666,9 @@ def run_write_mode(options):
         verbose_log(f'writing iter {i}')
         #gc.collect()
         #verbose_log('GC CALL')        
-        pixels = [
-            next(pixel_generator) for _ in range(n_subpixels)
-        ]
+        pixels = grab(pixel_generator, n_subpixels)
 
-        channels = ([
-            (
-                [3,3,2],
-                [3,2,3],
-                [2,3,3],
-            )[next(channel_generator)]
-            for _ in range(n_subpixels)
-        ])
+        channels = grab(channel_generator, n_subpixels)
 
         ih.write_pixels(
             indices = pixels,
